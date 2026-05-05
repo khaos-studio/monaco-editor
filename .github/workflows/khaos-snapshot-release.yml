@@ -1,0 +1,89 @@
+name: Khaos snapshot release
+
+on:
+  push:
+    tags:
+      - 'v*-khaos-snapshot.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)build a release for'
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    name: Build & publish snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          persist-credentials: false
+
+      - name: Resolve tag name
+        id: tag
+        run: |
+          REF="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "name=$REF" >> "$GITHUB_OUTPUT"
+          # Strip leading 'v' for npm semver-ish version
+          echo "version=${REF#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@khaos-studio'
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential pkg-config libx11-dev libx11-xcb-dev libxkbfile-dev libnotify-bin libkrb5-dev
+
+      - name: npm ci (root)
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+        run: npm ci
+
+      - name: npm run build
+        run: npm run build
+
+      - name: Rewrite package.json for @khaos-studio scope
+        run: |
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            pkg.name = '@khaos-studio/monaco-editor';
+            pkg.version = '${{ steps.tag.outputs.version }}';
+            pkg.repository = { type: 'git', url: 'https://github.com/khaos-studio/monaco-editor' };
+            pkg.publishConfig = { registry: 'https://npm.pkg.github.com' };
+            // Ship only the built artifacts + types, not source / tooling.
+            pkg.files = ['esm', 'min', 'min-maps', 'dev', 'monaco.d.ts', 'CHANGELOG.md', 'README.md', 'ThirdPartyNotices.txt', 'LICENSE'];
+            // Drop scripts that would re-run during downstream npm install.
+            delete pkg.scripts.postinstall;
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+      - name: Pack tarball
+        run: |
+          npm pack
+          ls -la *.tgz
+
+      - name: Publish to GitHub Packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm publish
+
+      - name: Attach tarball to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.tag.outputs.name }}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --notes "Khaos snapshot build of monaco-editor at $TAG."
+          fi
+          gh release upload "$TAG" *.tgz --clobber
